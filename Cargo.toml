@@ -1,0 +1,12 @@
+[package]
+name = "kentron-adapter"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "The kentron adapter for the B-rep protocol the conformance suite drives"
+publish = false
+
+[dependencies]
+brep-protocol = "2.0.1"
+# One kentron release, the one `VERSION` in src/main.rs names: moving to another is a change made here.
+kentron = "=0.19.2"
