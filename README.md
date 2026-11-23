@@ -29,30 +29,42 @@ holds every solid in one kentron `Model` and answers each function with kentron'
 | Function                                       | kentron                                                               |
 | ---------------------------------------------- | --------------------------------------------------------------------- |
 | `box`, `cylinder`, `sphere`, `torus`, `cone`   | `primitives::Cuboid`, `Cylinder`, `Sphere`, `Torus`, `Cone` (`build`) |
+| `slab`                                         | `primitives::Slab` (`build`)                                          |
 | `extrude`, `revolve`                           | `sweep::extrude`, `sweep::revolve`                                    |
 | `screw`                                        | `sweep::screw_extrude`, lead `2π·rise`, height `rise·angle`           |
 | `loft`, `loft_through`                         | `loft::loft`, ruled and smooth, closed into a solid                   |
 | `sweep`                                        | `sweep::pipe` along the path's lines and arcs                         |
-| `sweep_path`                                   | `sweep::pipe_with`, `Guide::Discrete` (least rotations)               |
+| `sweep_path`                                   | `sweep::pipe_with`, `Guide::Discrete` (least rotations), its `twist`  |
 | `union`, `intersection`, `difference`          | `boolean::union`, `intersection`, `difference`                        |
 | `union_all`, `difference_all`                  | `boolean::combine` (`Combination::Union`, `Difference`)               |
 | `fillet`, `fillet_radii`                       | `blend::fillet`, `blend::fillet_edges`                                |
+| `fillet_variable`                              | `blend::fillet_linear`, the radii ordered by the edge's vertices      |
+| `fillet_faces`, `full_round`                   | `blend::fillet_faces`, `blend::full_round`                            |
+| `fillet_setback`                               | `blend::fillet_setback`                                               |
+| `fillet_conic`, `fillet_g2`                    | `blend::fillet_conic`, `blend::fillet_g2`                             |
 | `chamfer`, `chamfer_two`, `chamfer_distances`  | `blend::chamfer`, `blend::chamfer_edges`                              |
 | `offset`                                       | `offset::shape`, joined by arcs                                       |
 | `offset_faces`                                 | `offset::shape_with_faces`, the other faces by 0, joined by meeting   |
 | `delete_faces`                                 | `defeature::remove_faces`                                             |
+| `move_faces`                                   | `draft::move_faces`                                                   |
 | `thicken`                                      | `offset::thicken`                                                     |
 | `shell`                                        | `offset::thick_solid` inward, joined by meeting                       |
 | `draft`                                        | `draft::draft`                                                        |
 | `write_step`, `read_step`                      | `io::step::write`, `io::step::read`                                   |
 | `sew`                                          | `sew::sew` of the faces `io::step::read` reads                        |
 | `volume`, `area`, `centroid`, `inertia`        | `properties::volume`, `properties::area`                              |
+| `normal`, `curvature`                          | `properties::normals`, `properties::curvatures`                       |
+| `interference`                                 | `boolean::interference`                                               |
+| `raycast`                                      | `raycast::raycast`, `raycast::raycast_all` for a batch                |
 | `bounding_box`                                 | `properties::tight_bounding_box`                                      |
 | `check`                                        | `validity::check`, its errors                                         |
 | `classify`                                     | `boolean::PointClassifier`                                            |
 | `closest`, `distance`                          | `distance::distance`                                                  |
 | `section`                                      | `boolean::section` with the unbounded plane                           |
+| `split`                                        | `boolean::cells` with the unbounded plane, pieces by side             |
+| `project`                                      | `hidden_lines::hidden_lines` in the protocol's view axes              |
 | `mesh`                                         | `meshing::triangulate`                                                |
+| `display`                                      | `meshing::display`                                                    |
 | `transform`, `affine`                          | `modify::transform`, `modify::transform_affine`                       |
 
 What the adapter adds is translation:
@@ -64,10 +76,12 @@ What the adapter adds is translation:
 - A point becomes the edge or face it lies on through kentron's distance query
   (`distance::distance` from a vertex at the point) at `10·ε`. A point that names no edge or face is
   refused as invalid; one within `10·ε` of several is refused as unsupported, not settled here.
+  A seam, where a face meets itself, names no edge: the protocol lists seams apart from edges.
 - A plane for `section` is kentron's unbounded planar face: a face on the plane with no boundary.
 - `sew`'s one closed shell becomes the shell of a solid.
-- The empty solid is kentron's empty compound. On it, `classify` gives every point outside,
-  `centroid` none and `inertia` zeros.
+- The empty solid is kentron's empty compound, a shape with no face, edge or vertex (the test
+  kentron's booleans make). On it, `classify` gives every point outside, `centroid` none and
+  `inertia` zeros; any other shape goes to kentron.
 - Where a kentron call takes a choice the protocol's definition makes, the adapter names it: a
   whole offset rounds by arcs (`Join::Arc`), the offsets of `offset_faces` and the walls of `shell`
   meet by extending the faces (`Join::Intersection`), and the ruled `loft` joins each point of the
@@ -83,20 +97,13 @@ as failed.
 
 | Function                                                                  | Why                                                                                           |
 | ------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| `slab`                                                                    | No constructor for a block under a B-spline height field                                      |
-| `fillet_variable`                                                         | `blend::fillet_evolving` runs the radius by a cubic flat at both ends, not evenly             |
-| `fillet_conic`, `fillet_g2`, `fillet_setback`, `fillet_setback_g2`        | No such blends                                                                                |
-| `fillet_faces`, `full_round`, `move_faces`                                | No such operations                                                                            |
-| `normal`, `curvature`, `raycast`                                          | No call at a point of a shape's boundary: only at a surface's parameters, or along a curve    |
-| `project`                                                                 | No hidden-line drawing                                                                        |
-| `display`                                                                 | The mesher gives triangles, not faces with normals and edges with their faces and turns       |
-| `split`                                                                   | `boolean::cells` leaves a solid whole against an unbounded plane, and a bounded face needs a size |
-| `interference`, `betti`, `section_area`                                   | Each only through other calls: a boolean and a distance, counts of shapes, a section's curves |
+| `fillet_setback_g2`                                                       | No such blend                                                                                 |
+| `betti`, `section_area`                                                   | Each only through other calls: counts of shapes, a section's curves                           |
 
-Also refused as unsupported: a twisted `sweep_path` (kentron's pipe has no twist law), a blend
-section (`gn`) segment in a profile, and a loft section with holes (kentron lofts wires).
+Also refused as unsupported: a blend section (`gn`) segment in a profile, a loft section with holes
+(kentron lofts wires), and `thicken` of more than one face (kentron thickens one sheet).
 
-[`Cargo.toml`](Cargo.toml) pins one kentron release from crates.io, 0.19.2, and `VERSION` in
+[`Cargo.toml`](Cargo.toml) pins one kentron release from crates.io, 0.19.3, and `VERSION` in
 [`src/main.rs`](src/main.rs) reports it; moving to another release is a change made here.
 
 ## Setup

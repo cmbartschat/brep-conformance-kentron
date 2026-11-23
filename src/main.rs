@@ -18,34 +18,24 @@ use kentron::math::{
 use kentron::topology::{Model, NodeKind, Shape};
 use kentron::{
     blend, boolean, defeature, distance, draft, io, loft, make, meshing, modify, offset,
-    primitives, properties, sew, sweep, tolerance, validity,
+    hidden_lines, primitives, properties, raycast, sew, sweep, tolerance, validity,
 };
 
 /// The kentron release this adapter builds against, as Cargo.toml pins it (kentron's crate
 /// exports no version).
-const VERSION: &str = "0.19.2";
+const VERSION: &str = "0.19.3";
 
 /// The contract's `10·ε` within which a point names an edge or a face.
 const NAMING: f64 = 10.0 * 1e-7;
 
 /// The functions kentron answers in one call. The rest of the protocol's, with why not:
 ///
-/// - `slab`: kentron has no constructor for a block under a B-spline height field.
-/// - `fillet_variable`: kentron's evolving fillet runs its radius by a cubic flat at both ends,
-///   not evenly along the edge.
-/// - `fillet_conic`, `fillet_g2`, `fillet_setback`, `fillet_setback_g2`, `fillet_faces`,
-///   `full_round`, `move_faces`: kentron has no such operation.
-/// - `normal`, `curvature`, `raycast`: kentron has no call that answers at a point of a shape's
-///   boundary (only at surface parameters, or along a curve).
-/// - `project`: kentron has no hidden-line drawing.
-/// - `display`: kentron's mesher gives triangles, not faces with normals and edges with the
-///   faces they bound and their turns.
-/// - `split`: kentron's splitter, `boolean::cells`, leaves a solid whole against an unbounded
-///   plane (or half-space), and a bounded face in its place would need a size of the adapter's.
-/// - `interference`, `betti`, `section_area`: kentron reaches each only through other calls (a
-///   boolean and a distance; counts of shapes; a section whose curves bound an area).
+/// - `fillet_setback_g2`: kentron has no such operation.
+/// - `betti`, `section_area`: kentron reaches each only through other calls (counts of shapes;
+///   a section whose curves bound an area).
 const SUPPORTED: &[&str] = &[
     "box",
+    "slab",
     "cylinder",
     "sphere",
     "torus",
@@ -64,12 +54,20 @@ const SUPPORTED: &[&str] = &[
     "difference_all",
     "fillet",
     "fillet_radii",
+    "fillet_variable",
+    "fillet_faces",
+    "full_round",
+    "fillet_setback",
+    "fillet_conic",
+    "fillet_g2",
+    "project",
     "chamfer",
     "chamfer_two",
     "chamfer_distances",
     "offset",
     "offset_faces",
     "delete_faces",
+    "move_faces",
     "thicken",
     "shell",
     "draft",
@@ -79,14 +77,20 @@ const SUPPORTED: &[&str] = &[
     "volume",
     "area",
     "classify",
+    "normal",
+    "curvature",
     "closest",
     "check",
     "centroid",
     "inertia",
     "distance",
+    "interference",
     "section",
     "bounding_box",
+    "split",
     "mesh",
+    "display",
+    "raycast",
     "transform",
     "affine",
 ];
@@ -286,7 +290,9 @@ impl Kentron {
     }
 
     /// The one edge, or face, of `s` within `10·ε` of each point, by kentron's distance from the
-    /// point to each. A point near several is not settled here: unsupported.
+    /// point to each. A point near several is not settled here: unsupported. A seam, where a face
+    /// meets itself, is no edge of the protocol's (it lists seams apart from edges), so it names
+    /// none.
     fn entities(
         &mut self,
         s: Shape,
@@ -298,11 +304,24 @@ impl Kentron {
         } else {
             "face"
         };
+        let mut seams = std::collections::HashSet::new();
+        if kind == NodeKind::Edge {
+            for face in self.model.unique_subshapes(s, NodeKind::Face) {
+                let Ok(face_id) = kentron::topology::FaceId::try_from(face.node) else { continue };
+                for edge in self.model.unique_subshapes(face, NodeKind::Edge) {
+                    let Ok(edge_id) = kentron::topology::EdgeId::try_from(edge.node) else { continue };
+                    if self.model.is_seam_on_face(edge_id, face_id) {
+                        seams.insert(edge_id);
+                    }
+                }
+            }
+        }
         let candidates: Vec<Shape> = self
             .model
             .unique_subshapes(s, kind)
             .into_iter()
             .filter(|&e| kind != NodeKind::Edge || !self.model.is_degenerate(e))
+            .filter(|&e| kentron::topology::EdgeId::try_from(e.node).is_ok_and(|id| !seams.contains(&id)) || kind != NodeKind::Edge)
             .collect();
         let mut found = Vec::with_capacity(points.len());
         for &p in points {
@@ -328,8 +347,10 @@ impl Kentron {
         Ok(found)
     }
 
-    fn has_solid(&self, s: Shape) -> bool {
-        self.model.explore(s, NodeKind::Solid).next().is_some()
+    /// The empty solid, as kentron's booleans test for it (`is_empty` in `boolean/mod.rs`, which
+    /// is private): a shape with no face, edge or vertex.
+    fn is_empty(&self, s: Shape) -> bool {
+        [NodeKind::Face, NodeKind::Edge, NodeKind::Vertex].iter().all(|&k| self.model.explore(s, k).next().is_none())
     }
 
     /// An unbounded planar face: kentron's plane through `origin` square to `normal`.
@@ -462,11 +483,6 @@ impl Kernel for Kentron {
                 twist,
                 ..
             } => {
-                if *twist != 0.0 {
-                    return Err(Refusal::unsupported(
-                        "a twisted sweep: kentron's pipe has no twist law",
-                    ));
-                }
                 let face = self.face(
                     profile,
                     &Sketch {
@@ -497,6 +513,7 @@ impl Kernel for Kentron {
                 // rotation-minimizing frame the function asks for.
                 let options = sweep::PipeOptions {
                     guide: Some(sweep::Guide::Discrete),
+                    twist: *twist,
                     ..Default::default()
                 };
                 Ok(sweep::pipe_with(&mut self.model, face, spine, &options)
@@ -538,9 +555,16 @@ impl Kernel for Kentron {
                     .map_err(e)?
                     .shape)
             }
-            Primitive::Slab { .. } => Err(Refusal::unsupported(
-                "slab: kentron has no block under a B-spline height field",
-            )),
+            Primitive::Slab {
+                size,
+                knots_u,
+                knots_v,
+                heights,
+                ..
+            } => primitives::Slab::new(size[0], size[1], knots_u.clone(), knots_v.clone(), heights.clone())
+                .with_frame(frame(&f)?)
+                .build(m)
+                .map_err(e),
         }
     }
 
@@ -599,7 +623,7 @@ impl Kernel for Kentron {
 
     fn classify(&mut self, s: &Shape, points: &[model::Vec3]) -> Result<Vec<model::Side>, Refusal> {
         // An empty solid holds no point.
-        if !self.has_solid(*s) {
+        if self.is_empty(*s) {
             return Ok(vec![model::Side::Out; points.len()]);
         }
         let classifier = boolean::PointClassifier::new(&self.model, *s).map_err(refusal)?;
@@ -625,7 +649,7 @@ impl Kernel for Kentron {
     }
 
     fn centroid(&mut self, s: &Shape) -> Result<Option<model::Vec3>, Refusal> {
-        if !self.has_solid(*s) {
+        if self.is_empty(*s) {
             return Ok(None);
         }
         Ok(Some(
@@ -634,7 +658,7 @@ impl Kernel for Kentron {
     }
 
     fn inertia(&mut self, s: &Shape) -> Result<[[f64; 3]; 3], Refusal> {
-        if !self.has_solid(*s) {
+        if self.is_empty(*s) {
             return Ok([[0.0; 3]; 3]);
         }
         let m = properties::volume(&self.model, *s).inertia;
@@ -759,18 +783,13 @@ impl Kernel for Kentron {
         thickness: f64,
     ) -> Result<Shape, Refusal> {
         let faces = self.entities(*s, faces, NodeKind::Face)?;
-        // kentron thickens a sheet: the one face, or the faces gathered in a shell.
-        let sheet = match faces[..] {
-            [one] => one,
-            _ => {
-                let shell = self.model.new_empty(NodeKind::Shell);
-                for &f in &faces {
-                    self.model.add(shell, f).map_err(refusal)?;
-                }
-                shell
-            }
+        let [face] = faces[..] else {
+            return Err(Refusal::unsupported(format!(
+                "thickening {} faces in one call: kentron thickens one sheet",
+                faces.len()
+            )));
         };
-        offset::thicken(&mut self.model, sheet, thickness, offset::Join::Arc).map_err(refusal)
+        offset::thicken(&mut self.model, face, thickness, offset::Join::Arc).map_err(refusal)
     }
 
     fn shell(&mut self, s: &Shape, open: &[model::Vec3], thickness: f64) -> Result<Shape, Refusal> {
@@ -929,6 +948,123 @@ impl Kernel for Kentron {
         Ok(loft::loft(&mut self.model, &sections, &options)
             .map_err(refusal)?
             .shape)
+    }
+
+    fn normal(&mut self, s: &Shape, points: &[model::Vec3]) -> Result<Vec<Option<model::Vec3>>, Refusal> {
+        let points: Vec<Point> = points.iter().map(|&p| point(p)).collect();
+        let normals = properties::normals(&mut self.model, *s, &points).map_err(refusal)?;
+        Ok(normals.into_iter().map(|n| n.map(|d| [d.x(), d.y(), d.z()])).collect())
+    }
+
+    fn curvature(&mut self, s: &Shape, points: &[model::Vec3]) -> Result<Vec<Option<[f64; 2]>>, Refusal> {
+        let points: Vec<Point> = points.iter().map(|&p| point(p)).collect();
+        let found = properties::curvatures(&mut self.model, *s, &points).map_err(refusal)?;
+        Ok(found.into_iter().map(|k| k.map(|k| [k.max, k.min])).collect())
+    }
+
+    fn interference(&mut self, a: &Shape, b: &Shape) -> Result<brep_protocol::Meeting, Refusal> {
+        let found = boolean::interference(&mut self.model, *a, *b).map_err(refusal)?;
+        Ok(brep_protocol::Meeting { volume: found.volume, gap: found.gap })
+    }
+
+    fn fillet_variable(&mut self, s: &Shape, edge: model::Vec3, from: model::Vec3, r_from: f64, r_to: f64) -> Result<Shape, Refusal> {
+        let edge = self.entities(*s, &[edge], NodeKind::Edge)?[0];
+        // kentron's radii run from the edge's first vertex to its last: `r_from` at whichever
+        // end is nearer `from`.
+        let (first, last) = self.model.edge_vertices(edge);
+        let (first, last) = (self.model.point(first), self.model.point(last));
+        let (to_first, to_last) = (first.distance(point(from)), last.distance(point(from)));
+        let radii = if to_first < to_last {
+            (r_from, r_to)
+        } else if to_last < to_first {
+            (r_to, r_from)
+        } else {
+            return Err(Refusal::invalid("`from` is as near one end of the edge as the other"));
+        };
+        blend::fillet_linear(&mut self.model, *s, &[(edge, radii.0, radii.1)]).map_err(refusal)
+    }
+
+    fn fillet_faces(&mut self, s: &Shape, face_a: model::Vec3, face_b: model::Vec3, radius: f64) -> Result<Shape, Refusal> {
+        let faces = self.entities(*s, &[face_a, face_b], NodeKind::Face)?;
+        blend::fillet_faces(&mut self.model, *s, faces[0], faces[1], radius).map_err(refusal)
+    }
+
+    fn full_round(&mut self, s: &Shape, side_a: model::Vec3, middle: model::Vec3, side_b: model::Vec3) -> Result<Shape, Refusal> {
+        let faces = self.entities(*s, &[side_a, middle, side_b], NodeKind::Face)?;
+        blend::full_round(&mut self.model, *s, faces[0], faces[1], faces[2]).map_err(refusal)
+    }
+
+    fn fillet_setback(&mut self, s: &Shape, edges: &[model::Vec3], radius: f64, setback: f64) -> Result<Shape, Refusal> {
+        let edges = self.entities(*s, edges, NodeKind::Edge)?;
+        blend::fillet_setback(&mut self.model, *s, &edges, radius, setback).map_err(refusal)
+    }
+
+    fn fillet_conic(&mut self, s: &Shape, edges: &[model::Vec3], setback: f64, rho: f64) -> Result<Shape, Refusal> {
+        let edges = self.entities(*s, edges, NodeKind::Edge)?;
+        blend::fillet_conic(&mut self.model, *s, &edges, setback, rho).map_err(refusal)
+    }
+
+    fn fillet_g2(&mut self, s: &Shape, edges: &[model::Vec3], offset: f64, center: f64) -> Result<Shape, Refusal> {
+        let edges = self.entities(*s, edges, NodeKind::Edge)?;
+        blend::fillet_g2(&mut self.model, *s, &edges, offset, center).map_err(refusal)
+    }
+
+    fn project(&mut self, s: &Shape, d: model::Vec3, tolerance: f64) -> Result<brep_protocol::Projection, Refusal> {
+        // The protocol's view axes as kentron's view frame: its x across, its z toward the
+        // viewer, so that its y is the protocol's axis up.
+        let toward = direction([-d[0], -d[1], -d[2]])?;
+        let (u, _) = brep_protocol::view_axes(d);
+        let view = Frame::new(Point::ORIGIN, toward, direction(u)?);
+        let drawn = hidden_lines::hidden_lines(&self.model, *s, &view, tolerance).map_err(refusal)?;
+        let flat = |lines: Vec<hidden_lines::DrawnLine>| lines.into_iter().map(|l| l.points.into_iter().map(|p| [p.x, p.y]).collect()).collect();
+        Ok(brep_protocol::Projection::new(flat(drawn.visible), flat(drawn.hidden)))
+    }
+
+    fn split(&mut self, s: &Shape, origin: model::Vec3, normal: model::Vec3) -> Result<(Shape, Shape), Refusal> {
+        let n = direction(normal)?;
+        let plane = make::whole_face(&mut self.model, Surface::Plane(Plane::new(point(origin), n))).map_err(refusal)?;
+        let cells = boolean::cells(&mut self.model, &[*s, plane]).map_err(refusal)?;
+        // The solid's pieces, sorted by side: each lies wholly on one side of the plane, its
+        // centroid with it.
+        let (ahead, behind) = (self.model.new_empty(NodeKind::Compound), self.model.new_empty(NodeKind::Compound));
+        for cell in cells.iter().filter(|c| c.inside[0] && c.shape.kind() == NodeKind::Solid) {
+            let centre = properties::volume(&self.model, cell.shape).center_of_mass;
+            let side = if (centre - point(origin)).dot(n.into()) > 0.0 { ahead } else { behind };
+            self.model.add(side, cell.shape).map_err(refusal)?;
+        }
+        Ok((ahead, behind))
+    }
+
+    fn move_faces(&mut self, s: &Shape, faces: &[model::Vec3], matrix: [[f64; 4]; 3]) -> Result<Shape, Refusal> {
+        let faces = self.entities(*s, faces, NodeKind::Face)?;
+        let motion = Transform::from_rows(matrix).ok_or_else(|| Refusal::invalid("a singular matrix"))?;
+        draft::move_faces(&mut self.model, *s, &faces, &motion).map_err(refusal)
+    }
+
+    fn display(&mut self, s: &Shape, tolerance: f64) -> Result<brep_protocol::Display, Refusal> {
+        let d = meshing::display(&mut self.model, *s, tolerance).map_err(refusal)?;
+        let dir = |n: Direction| [n.x(), n.y(), n.z()];
+        let faces = d
+            .faces
+            .into_iter()
+            .map(|f| brep_protocol::DisplayFace::new(f.positions.into_iter().map(xyz).collect(), f.normals.into_iter().map(dir).collect(), f.triangles))
+            .collect();
+        let edges = d
+            .edges
+            .into_iter()
+            .map(|e| brep_protocol::DisplayEdge::new(e.points.into_iter().map(xyz).collect(), e.faces, e.turn, e.split))
+            .collect();
+        let seams = d.seams.into_iter().map(|p| p.into_iter().map(xyz).collect()).collect();
+        Ok(brep_protocol::Display::new(faces, edges, seams))
+    }
+
+    fn raycast(&mut self, s: &Shape, origin: model::Vec3, direction: model::Vec3) -> Result<Vec<f64>, Refusal> {
+        raycast::raycast(&self.model, *s, point(origin), vector(direction)).map_err(refusal)
+    }
+
+    fn raycasts(&mut self, s: &Shape, rays: &[(model::Vec3, model::Vec3)]) -> Result<Vec<Vec<f64>>, Refusal> {
+        let rays: Vec<(Point, Vector)> = rays.iter().map(|&(o, d)| (point(o), vector(d))).collect();
+        raycast::raycast_all(&self.model, *s, &rays).map_err(refusal)
     }
 
     fn reset(&mut self) {
